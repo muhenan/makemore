@@ -158,26 +158,67 @@ class CausalSelfAttention(nn.Module):
 
         # ── 第三步：计算 attention ────────────────────────────────────────────
         #
-        # q @ k.T：(B, 4, T, 16) × (B, 4, 16, T) → (B, 4, T, T)
-        # 每个头独立计算 T×T 的注意力矩阵
+        # k.transpose(-2, -1)：把 k 最后两维互换
+        #   (B, 4, T, 16) → (B, 4, 16, T)
+        #
+        # q @ k.T：标准矩阵乘法，B 和 4 是批量维度自动广播
+        #   (B, 4, T, 16) @ (B, 4, 16, T) → (B, 4, T, T)
+        #
+        # 结果 att[b][h][i][j] = q[b][h][i] 和 k[b][h][j] 的点积
+        # 表示第 h 个头里，位置 i 对位置 j 的原始相似度分数
+        # 这就是 T×T 的位置注意力矩阵，每个元素 [i][j] = 位置 i 对位置 j 的关注程度
+        #
+        # 为什么需要 Q 和 K 两个，而不是直接用 x 自己点积：
+        #   如果直接 x[i] · x[j]，结果是对称的，x[i]·x[j] == x[j]·x[i]
+        #   意味着"i 关注 j 的程度"永远等于"j 关注 i 的程度"，不符合语言规律
+        #   有了 Q 和 K，Q[i]·K[j] != Q[j]·K[i]，注意力矩阵不再对称
+        #   Q = x @ Wq  → "我想找什么"的空间
+        #   K = x @ Wk  → "我能提供什么"的空间
+        #   Q[i]·K[j] 问的是：位置 i 想找的东西，和位置 j 能提供的东西，匹不匹配？
+        #   Wq 和 Wk 是两套独立参数，训练时各自优化
+        #
+        # 除以 sqrt(hs)：hs=16，sqrt(16)=4
+        #   q @ k 的结果方差约为 hs，除以 sqrt(hs) 把方差归一化到 1
+        #   防止点积值太大导致 softmax 后梯度消失（概率全压到一个位置）
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
 
         # causal mask：右上角填 -inf，确保每个位置只能看左边
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)  # (B, 4, T, T)
+        # ── 激活值说明 ────────────────────────────────────────────────────────
+        # 到这里为止，前向传播产生的激活值（非参数，不会保存到 model.pt）：
+        #   q, k, v : (B, 4, T, 16) 各一份
+        #   att     : (B, 4, T, T)
+        # 这些值训练时必须保留在显存里，反向传播算梯度时需要用到它们。
+        # 例如 att 对 q 求梯度时，必须知道当时 att 的值是多少。
+        # 反向传播完成后才会释放。
+        #
+        # 激活值的显存消耗（B=32, T=16, n_head=4, hs=16, float32=4字节）：
+        #   att: 32×4×16×16×4 = 131,072 字节 ≈ 128KB，乘以 4 层 Block ≈ 512KB
+        # batch size 越大、序列越长，激活值以 T² 速度增长，
+        # 训练大模型时显存瓶颈往往是激活值而不是参数本身。
 
         # ── 第四步：用 V 做加权求和 ───────────────────────────────────────────
         #
         # att @ v：(B, 4, T, T) × (B, 4, T, 16) → (B, 4, T, 16)
         # 和 BoW 的 att @ x 完全一样的操作，只是权重不再均等
+        # 每个头独立完成自己的加权求和，4 个头并行，互不干扰
         y = att @ v  # (B, 4, T, 16)
 
         # ── 第五步：拼回多头，输出投影 ────────────────────────────────────────
         #
-        # (B, 4, T, 16) → transpose → (B, T, 4, 16) → view → (B, T, 64)
+        # transpose(1, 2)：(B, 4, T, 16) → (B, T, 4, 16)，把 n_head 移回去
+        # .contiguous()：transpose 后内存不连续，view 之前必须先整理内存布局
+        # .view(B, T, C)：(B, T, 4, 16) → (B, T, 64)，把 4 个头拼回一个向量
+        #
+        # 此时 y 是 4 个头的简单拼接：
+        #   [head0的16维 | head1的16维 | head2的16维 | head3的16维]
+        #   各个头的信息还是相互独立的，head0 的值不受 head1 影响
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # 输出投影：混合各个头的信息
+        # c_proj 是 Linear(64, 64)，让每个输出值都能看到全部 64 维的输入
+        # 作用：混合各个头的信息，head0 和 head1 的内容在这里产生交互
+        # 没有这一层，4 个头只是拼接，永远不会互相影响
         y = self.c_proj(y)  # (B, T, 64)
         return y
 
@@ -302,20 +343,34 @@ class Transformer(nn.Module):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device).unsqueeze(0)  # (1, T)
 
-        # 和 BoW 完全一样：token embedding + position embedding 相加
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # (1, T, n_embd)
-        x = tok_emb + pos_emb               # (B, T, n_embd)
+        # ── 第一步：双重 Embedding 相加 ───────────────────────────────────────
+        # 和 BoW 完全一样，并行模型必须手动注入位置信息
+        tok_emb = self.transformer.wte(idx)  # (B, T, 64)：字符是什么
+        pos_emb = self.transformer.wpe(pos)  # (1, T, 64)：在哪个位置
+        x = tok_emb + pos_emb               # (B, T, 64)：两种信息合并到同一向量
 
-        # 逐层通过 n_layer 个 Block，每层都做一遍 Attention + MLP
+        # ── 第二步：逐层通过 Block ────────────────────────────────────────────
+        # 每个 Block 内部：
+        #   x = x + Attention(LayerNorm(x))   ← 残差让原始 x 直通，不经过 LN
+        #   x = x + MLP(LayerNorm(x))         ← 残差让原始 x 直通，不经过 LN
+        # 残差那条路永远是直通的，梯度可以沿这条高速公路一路流回最开始
+        #
+        # 每层 Block 输入输出 shape 相同 (B, T, 64)，可以任意堆叠多少层
+        # 第1层：学字符级局部模式
+        # 第2层：在第1层基础上学更抽象的组合
+        # 第3、4层：更高层次的规律
         for block in self.transformer.h:
-            x = block(x)                    # (B, T, n_embd) → (B, T, n_embd)
+            x = block(x)                    # (B, T, 64) → (B, T, 64)
 
-        # 最后一次 LayerNorm
-        x = self.transformer.ln_f(x)        # (B, T, n_embd)
+        # ── 第三步：最后的 LayerNorm ──────────────────────────────────────────
+        # 最后一个 Block 输出经过残差加法后分布可能偏移，
+        # 归一化到均值 0 方差 1，让 lm_head 每次接收到稳定的输入分布
+        x = self.transformer.ln_f(x)        # (B, T, 64)
 
-        # 解码成 logit
-        logits = self.lm_head(x)            # (B, T, vocab_size)
+        # ── 第四步：解码 ──────────────────────────────────────────────────────
+        # Linear(64 → 27)，无 bias（GPT-2 的做法，少 27 个参数，影响极小）
+        # 把每个位置的 64 维向量映射到词表大小，得到下一个字符的 logit 分布
+        logits = self.lm_head(x)            # (B, T, 27)
 
         loss = None
         if targets is not None:
