@@ -76,6 +76,49 @@ lucianno
 
 Have fun!
 
+### 学习笔记：核心概念
+
+#### 词表（Vocabulary）& Tokenizer
+
+词表是"符号 → 整数 index"的映射表。本项目词表只有 27 个 token（26 个小写字母 + 1 个特殊 token）。
+
+Tokenizer 负责 encode（文本 → index）和 decode（index → 文本），在 `CharDataset` 里实现：
+
+```python
+self.stoi = {ch: i+1 for i, ch in enumerate(chars)}  # encode
+self.itos = {i: s for s, i in self.stoi.items()}      # decode
+```
+
+词表和 Tokenizer 是配套的，两者绑定在一起。GPT-4 的词表有 10 万个 token，使用 BPE（字节对编码）把常见字符组合合并成单个 token。
+
+#### Token Embedding（wte）
+
+```python
+self.wte = nn.Embedding(vocab_size, n_embd)  # (27, 64)
+```
+
+一张可学习的矩阵，把整数 index 映射成 64 维连续向量。整数本身没有语义，embedding 让相似的字符可以有相近的向量，训练时由梯度调整。
+
+#### Position Embedding（wpe）
+
+```python
+self.wpe = nn.Embedding(block_size, n_embd)  # (16, 64)
+```
+
+并行模型（BoW、Transformer）同时处理所有位置，不知道每个字符在第几位，需要额外注入位置信息。位置 0~15 各对应一行 64 维向量，与 token embedding 直接相加。RNN 不需要这个，因为它按顺序串行处理，天然知道位置。
+
+#### 三者的完整流程
+
+```
+原始文本 "emma"
+    ↓ tokenizer
+[5, 13, 13, 1]              整数序列
+    ↓ wte
+(4, 64) 语义向量
+    ↓ + wpe
+(4, 64) 语义 + 位置          送入模型
+```
+
 ### License
 
 MIT
