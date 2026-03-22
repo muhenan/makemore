@@ -63,12 +63,36 @@ class MLP(nn.Module):
         self.block_size = config.block_size
         self.vocab_size = config.vocab_size
 
-        # Embedding 表：+1 是因为需要一个额外的 <BLANK> token（index = vocab_size）
-        # 用于填充窗口开头"还没有字符"的位置
+        # Embedding 表：把整数 index 映射成 n_embd 维的连续向量
+        # 比 Bigram 直接查行更有表达力：相似的字符可以有相近的向量
+        # +1 是因为需要一个额外的 <BLANK> token（index = vocab_size）
+        # 用于填充窗口开头"还没有字符"的位置（序列前面的虚空位置）
         self.wte = nn.Embedding(config.vocab_size + 1, config.n_embd)
 
-        # MLP：输入是 block_size 个 embedding 拼在一起
-        # block_size * n_embd → n_embd2 → vocab_size
+        # MLP 两层全连接网络：
+        #   输入：block_size 个字符的 embedding 拼在一起，shape = block_size * n_embd
+        #   隐藏：n_embd2 个神经元，Tanh 激活引入非线性
+        #         没有非线性的话多层线性等价于一层线性，学不到字符组合规律
+        #   输出：vocab_size 个 logit，表示下一个字符的得分
+        #
+        # 参数量明细（默认值 block_size=16, n_embd=64, n_embd2=64, vocab_size=27）：
+        #
+        #   Embedding:
+        #     (vocab_size+1) × n_embd = 28 × 64 = 1,792
+        #
+        #   Linear1（权重 + 偏置）:
+        #     (block_size × n_embd) × n_embd2 + n_embd2
+        #     = (16 × 64) × 64 + 64
+        #     = 1024 × 64 + 64 = 65,536 + 64 = 65,600
+        #
+        #   Linear2（权重 + 偏置）:
+        #     n_embd2 × vocab_size + vocab_size
+        #     = 64 × 27 + 27 = 1,728 + 27 = 1,755
+        #
+        #   总计: 1,792 + 65,600 + 1,755 = 69,147
+        #   对比 Bigram: 27 × 27 = 729，MLP 参数量约是 Bigram 的 95 倍
+        #
+        # 瓶颈在 Linear1：block_size 越大，输入维度越高，参数量增长越快
         self.mlp = nn.Sequential(
             nn.Linear(self.block_size * config.n_embd, config.n_embd2),
             nn.Tanh(),
@@ -79,34 +103,74 @@ class MLP(nn.Module):
         return self.block_size
 
     def forward(self, idx, targets=None):
-        """
-        滑动窗口拼接的实现方式：
+        # ── 滑动窗口拼接 ──────────────────────────────────────────────────────
+        #
+        # 目标：对序列里每个位置 t，收集它前面 block_size 个字符的 embedding，
+        #       拼在一起作为 MLP 的输入。
+        #
+        # 假设 block_size=3，输入序列 idx = [a, b, c, d, e]
+        # 我们希望得到（每行是一个位置的输入，→ 右边是要预测的目标）：
+        #
+        #   位置0: [<B>, <B>,  a ] → 预测 b
+        #   位置1: [<B>,  a,   b ] → 预测 c
+        #   位置2: [ a,   b,   c ] → 预测 d
+        #   位置3: [ b,   c,   d ] → 预测 e
+        #   位置4: [ c,   d,   e ] → 预测 ?
+        #
+        # ── roll 的工作原理 ───────────────────────────────────────────────────
+        #
+        # torch.roll(idx, 1, 1) 把序列在时间轴（dim=1）上整体右移一位，
+        # 最右边的元素会绕回到最左边：
+        #
+        #   原始:  [a, b, c, d, e]
+        #   roll:  [e, a, b, c, d]  ← e 从末尾绕回到开头（不想要）
+        #
+        # 所以 roll 之后立刻把第 0 列覆盖成 <BLANK>：
+        #   修正:  [<B>, a, b, c, d]  ← 正确，表示"向左看一位"
+        #
+        # ── 三次循环过程 ──────────────────────────────────────────────────────
+        #
+        # k=0: idx = [a, b, c, d, e]      → embed → emb0（当前字符）
+        #      roll → [e, a, b, c, d]，修正 → [<B>, a, b, c, d]
+        #
+        # k=1: idx = [<B>, a, b, c, d]    → embed → emb1（前1个字符）
+        #      roll → [d, <B>, a, b, c]，修正 → [<B>, <B>, a, b, c]
+        #
+        # k=2: idx = [<B>, <B>, a, b, c]  → embed → emb2（前2个字符）
+        #      roll → ...（后续不再用 idx）
+        #
+        # cat([emb0, emb1, emb2], dim=-1) 后每个位置的内容：
+        #   位置0: [embed(a),   embed(<B>), embed(<B>)]
+        #   位置1: [embed(b),   embed(a),   embed(<B>)]
+        #   位置2: [embed(c),   embed(b),   embed(a)  ]
+        #   位置3: [embed(d),   embed(c),   embed(b)  ]
+        #
+        # 注意：emb0 是当前字符，emb1 是前1个，emb2 是前2个
+        # 拼接顺序是 [当前, 前1, 前2]，和直觉上的 [前2, 前1, 当前] 相反，
+        # 但对 MLP 来说无所谓，因为它会学到每个槽位的语义
 
-        假设 block_size=3，输入 idx = [a, b, c, d, e]，我们想得到：
-            位置 0 的输入：[<B>, <B>, a]  → 预测 b
-            位置 1 的输入：[<B>, a,   b]  → 预测 c
-            位置 2 的输入：[a,   b,   c]  → 预测 d
-            ...
-
-        代码实现：循环 block_size 次，每次把 idx 向右 roll 一位，
-        然后把当前 idx 的 embedding 收集起来，最后拼接。
-
-        第 0 次（k=0）：idx=[a,b,c,d,e]    → 收集当前位置 embedding
-        第 1 次（k=1）：idx=[<B>,a,b,c,d]  → 收集前 1 位 embedding
-        第 2 次（k=2）：idx=[d,<B>,a,b,c]  → 收集前 2 位 embedding
-        最后 cat([emb2, emb1, emb0])，得到每个位置"前3个字符"的表示
-        """
         embs = []
         for k in range(self.block_size):
-            tok_emb = self.wte(idx)          # (B, T, n_embd)：当前 idx 的 embedding
-            idx = torch.roll(idx, 1, 1)      # 整体向右 roll 一位（时间轴方向）
-            idx[:, 0] = self.vocab_size      # 最左边空出来的位置填 <BLANK>
+            tok_emb = self.wte(idx)          # (B, T, n_embd)
+            idx = torch.roll(idx, 1, 1)      # 右移一位
+            idx[:, 0] = self.vocab_size      # 修正左边界：填 <BLANK>
             embs.append(tok_emb)
 
-        # 拼接：每个 emb (B, T, n_embd) → 拼后 (B, T, n_embd * block_size)
-        x = torch.cat(embs, -1)
+        # ── 数据流总览（block_size=16, n_embd=64 为例）────────────────────────
+        #
+        # idx                              (B, T)           = (32, 16)
+        #   ↓ Embedding × block_size 次
+        # embs: 16 个 tensor              各 (B, T, 64)
+        #   ↓ cat(dim=-1)
+        # x                               (B, T, 64*16)    = (32, 16, 1024)
+        #   ↓ Linear(1024 → 64)
+        #   ↓ Tanh
+        # hidden                          (B, T, 64)        = (32, 16, 64)
+        #   ↓ Linear(64 → 27)
+        # logits                          (B, T, vocab_size) = (32, 16, 27)
 
-        logits = self.mlp(x)  # (B, T, vocab_size)
+        x = torch.cat(embs, -1)   # (B, T, n_embd * block_size)
+        logits = self.mlp(x)      # (B, T, vocab_size)
 
         loss = None
         if targets is not None:
