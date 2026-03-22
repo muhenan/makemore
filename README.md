@@ -76,7 +76,7 @@ lucianno
 
 Have fun!
 
-### 学习笔记：核心概念
+### 核心概念
 
 #### 词表（Vocabulary）& Tokenizer
 
@@ -99,13 +99,31 @@ self.wte = nn.Embedding(vocab_size, n_embd)  # (27, 64)
 
 一张可学习的矩阵，把整数 index 映射成 64 维连续向量。整数本身没有语义，embedding 让相似的字符可以有相近的向量，训练时由梯度调整。
 
-#### Position Embedding（wpe）
+"语义相近的词 embedding 接近"不是人为设计的，是训练的副产品：模型为了更好地预测，会把出现在相似上下文里的词推向相近的方向，语义相似性自然涌现。
 
-```python
-self.wpe = nn.Embedding(block_size, n_embd)  # (16, 64)
+**业界做法：**
+- **从头训练**：大模型训练时 embedding 层作为模型的一部分端到端一起训，无特殊处理
+- **用预训练的**：OpenAI 有专门的 `text-embedding` API，输入文本返回向量，用于语义搜索、RAG 等场景；HuggingFace 上也有大量开源预训练 embedding 模型
+- **继承权重**：Fine-tune 时直接用 GPT-2、LLaMA 的权重初始化，embedding 层一并继承
+
+小公司基本不从头训 embedding，直接调 API 或用开源预训练权重。
+
+#### Position Embedding
+
+并行模型（BoW、Transformer）同时处理所有位置，不知道每个字符在第几位，需要额外注入位置信息。RNN 不需要，因为它串行处理，天然知道位置。
+
+**原始论文（Vaswani 2017）：三角函数，固定不可学习**
+
+```
+PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
 ```
 
-并行模型（BoW、Transformer）同时处理所有位置，不知道每个字符在第几位，需要额外注入位置信息。位置 0~15 各对应一行 64 维向量，与 token embedding 直接相加。RNN 不需要这个，因为它按顺序串行处理，天然知道位置。
+低维用高频波（相邻位置差异大），高维用低频波（远距离才有差异），每个位置都有唯一的向量指纹。优点是可以外推到训练时没见过的更长序列。
+
+**现代业界主流：RoPE（旋转位置编码）**
+
+LLaMA、Mistral、GPT-NeoX 等主流大模型都在用。不是把位置向量加到 embedding 上，而是把位置信息"旋转"进 Q 和 K 里，天然支持长序列外推，实践效果更好。三角函数方案现在基本只在论文和教学中出现。
 
 #### 三者的完整流程
 
