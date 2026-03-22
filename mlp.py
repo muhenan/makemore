@@ -95,7 +95,7 @@ class MLP(nn.Module):
         # 瓶颈在 Linear1：block_size 越大，输入维度越高，参数量增长越快
         self.mlp = nn.Sequential(
             nn.Linear(self.block_size * config.n_embd, config.n_embd2),
-            nn.Tanh(),
+            nn.Tanh(), # 激活函数，引入非线性。如果不引入非线性，多层线性等价于一层线性，学不到字符组合规律
             nn.Linear(config.n_embd2, self.vocab_size)
         )
 
