@@ -1,0 +1,29 @@
+.DS_Store
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Training outputs and checkpoints
+out_bigram/
+*.pt
+events.out.tfevents.*
